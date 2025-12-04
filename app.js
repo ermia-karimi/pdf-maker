@@ -361,7 +361,7 @@ document.getElementById("imagePicker").addEventListener("change", async (e) => {
     // اجازه بده UI واکنش نشان دهد
     await new Promise(r => setTimeout(r, 40));
 
-    showToast(`تعداد عکس: ${pickedImages.length}`, 1200);
+    showToast(`Number of photos: ${pickedImages.length}`, 1200);
 });
 
 /* ---------- انتخاب سایز ---------- */
