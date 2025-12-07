@@ -1,5 +1,12 @@
+// app.js — Snap2Pdf Ultra-Fast + Force-Share + Fit + Compression + Chunked
 let pickedImages = [];
-let pdfSize = "zeroloss"; // حالت پیش‌فرض
+let pdfSize = "a4";
+
+// ---------- CONFIG ----------
+const DEFAULT_MAX_DIM = 1500;   // recommended max pixel dimension for longest side
+const DEFAULT_QUALITY = 0.85;   // JPEG quality: 0.5 .. 1
+const CHUNK_SIZE = 20;          // number of images per chunk
+const MIN_TICK = 3;             // ms to yield to UI between images
 
 // ---------- DOM refs ----------
 const inputEl = document.getElementById("imagePicker");
@@ -16,11 +23,9 @@ function showToast(msg = "", duration = 1800) {
     clearTimeout(showToast._t);
     showToast._t = setTimeout(() => toastEl.classList.remove("show"), duration);
 }
-
 function setStatus(text = "") {
     if (!hh11) return;
     hh11.innerText = text;
-    console.log(text);
 }
 
 // ---------- File select ----------
@@ -37,144 +42,164 @@ sizeButtons.addEventListener("click", (ev) => {
     if (!btn) return;
     document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    pdfSize = btn.dataset.size || "zeroloss";
+    pdfSize = btn.dataset.size || "a4";
 });
 
 // ---------- Helpers ----------
-async function fileToDataURL(file) {
-    return new Promise(res => {
-        const fr = new FileReader();
-        fr.onload = () => res(fr.result);
-        fr.readAsDataURL(file);
+function fileToDataURL(file) {
+    return new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = () => res(reader.result);
+        reader.onerror = rej;
+        reader.readAsDataURL(file);
     });
 }
-
-async function processImageRaw(file) {
-    const dataUrl = await fileToDataURL(file);
-    const bitmap = await createImageBitmap(file);
-    const format = dataUrl.includes("png") ? "PNG" : "JPEG";
-    return { dataUrl, bitmap, format };
+function loadImage(src) {
+    return new Promise((res, rej) => {
+        const img = new Image();
+        img.onload = () => res(img);
+        img.onerror = rej;
+        img.crossOrigin = "anonymous";
+        img.src = src;
+    });
 }
-
-function getA4SizePx() {
-    const DPI = 96;
-    return [Math.round(8.27 * DPI), Math.round(11.69 * DPI)];
-}
-
-// ---------- Zero-Loss fixer ----------
-async function prepareZeroLossImage(imgObj) {
-    const MAX = 14000;
-
-    let w = imgObj.bitmap.width;
-    let h = imgObj.bitmap.height;
-
-    // محدود کردن سایز jsPDF
-    const ratio = Math.min(MAX / w, MAX / h, 1);
+const reuseCanvas = document.createElement("canvas");
+const reuseCtx = reuseCanvas.getContext("2d");
+function compressImageToDataURL(img, maxDim, quality) {
+    let w = img.width;
+    let h = img.height;
+    const ratio = Math.min(maxDim / w, maxDim / h, 1);
     w = Math.round(w * ratio);
     h = Math.round(h * ratio);
+    reuseCanvas.width = w;
+    reuseCanvas.height = h;
+    reuseCtx.clearRect(0, 0, w, h);
+    reuseCtx.drawImage(img, 0, 0, w, h);
+    return reuseCanvas.toDataURL("image/jpeg", quality);
+}
+async function processImageFile(file, maxDim, quality) {
+    const dataUrl = await fileToDataURL(file);
+    const img = await loadImage(dataUrl);
+    return compressImageToDataURL(img, maxDim, quality);
+}
 
-    // عکس‌های خیلی کشیده یا کوچک → padded canvas
-    if (w < 50 || h < 50) {
-        const pad = 100;
-        const canvas = document.createElement("canvas");
-        canvas.width = w + pad;
-        canvas.height = h + pad;
-        const ctx = canvas.getContext("2d");
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(imgObj.bitmap, pad / 2, pad / 2, w, h);
-        return { dataUrl: canvas.toDataURL("image/png"), w: canvas.width, h: canvas.height, format: "PNG" };
-    }
-
-    // تبدیل CMYK و یا MIME عجیب → PNG
-    if (!imgObj.dataUrl.startsWith("data:image/")) {
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(imgObj.bitmap, 0, 0, w, h);
-        return { dataUrl: canvas.toDataURL("image/png"), w, h, format: "PNG" };
-    }
-
-    // حالت عادی: scale فقط برای سقف jsPDF
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(imgObj.bitmap, 0, 0, w, h);
-
-    return { dataUrl: canvas.toDataURL("image/png"), w, h, format: "PNG" };
+// ---------- Fit page size ----------
+const FIT_MAX_DIM = 2500;
+function calcFitPageSize(imgW, imgH, uiMax) {
+    const maxDim = Math.max(imgW, imgH);
+    const cap = Math.min(FIT_MAX_DIM, uiMax || DEFAULT_MAX_DIM);
+    if (maxDim <= cap) return [imgW, imgH];
+    const scale = cap / maxDim;
+    return [Math.round(imgW * scale), Math.round(imgH * scale)];
 }
 
 // ---------- Main PDF creation ----------
 convertBtn.addEventListener("click", async () => {
-    if (!pickedImages.length) {
-        showToast("Select photos first");
-        return;
-    }
-
-    setStatus("Preparing PDF...");
-    const { jsPDF } = window.jspdf;
-    const MAX_PAGE_SIZE = 14000;
-
-    // ---------- Process first image ----------
-    const first = await processImageRaw(pickedImages[0]);
-    let pageW, pageH;
-    let pdf;
-
-    if (pdfSize === "zeroloss") {
-        const fixed = await prepareZeroLossImage(first);
-        pageW = fixed.w;
-        pageH = fixed.h;
-        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
-        pdf.addImage(fixed.dataUrl, fixed.format, 0, 0, pageW, pageH);
-    } else if (pdfSize === "a4") {
-        [pageW, pageH] = getA4SizePx();
-        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
-
-        const scale = Math.min(pageW / first.bitmap.width, pageH / first.bitmap.height);
-        const w = first.bitmap.width * scale;
-        const h = first.bitmap.height * scale;
-        const x = (pageW - w) / 2;
-        const y = (pageH - h) / 2;
-        pdf.addImage(first.dataUrl, first.format, x, y, w, h);
-    } else if (pdfSize === "fit") {
-        pageW = Math.min(first.bitmap.width, MAX_PAGE_SIZE);
-        pageH = Math.min(first.bitmap.height, MAX_PAGE_SIZE);
-        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
-        pdf.addImage(first.dataUrl, first.format, 0, 0, pageW, pageH);
-    }
-
-    // ---------- Process remaining images ----------
-    for (let i = 1; i < pickedImages.length; i++) {
-        const img = await processImageRaw(pickedImages[i]);
-
-        let drawObj;
-        if (pdfSize === "zeroloss") drawObj = await prepareZeroLossImage(img);
-        else drawObj = img;
-
-        pdf.addPage([drawObj.w || pageW, drawObj.h || pageH]);
-
-        if (pdfSize === "zeroloss" || pdfSize === "fit") {
-            pdf.addImage(drawObj.dataUrl, drawObj.format, 0, 0, drawObj.w, drawObj.h);
-        } else if (pdfSize === "a4") {
-            const scale = Math.min(pageW / img.bitmap.width, pageH / img.bitmap.height);
-            const w = img.bitmap.width * scale;
-            const h = img.bitmap.height * scale;
-            const x = (pageW - w) / 2;
-            const y = (pageH - h) / 2;
-            pdf.addImage(img.dataUrl, img.format, x, y, w, h);
+    try {
+        if (!pickedImages.length) {
+            showToast("Please select photos first", 2000);
+            return;
         }
 
-        setStatus(`Processed ${i + 1} / ${pickedImages.length}`);
-    }
+        const maxDimInput = document.getElementById("maxDim");
+        const qualityInput = document.getElementById("quality");
+        const uiMax = maxDimInput ? Math.max(600, Math.min(4000, Number(maxDimInput.value) || DEFAULT_MAX_DIM)) : DEFAULT_MAX_DIM;
+        const uiQuality = qualityInput ? Math.max(0.5, Math.min(1, Number(qualityInput.value) || DEFAULT_QUALITY)) : DEFAULT_QUALITY;
 
-    pdf.save("Snap2PDF_Final.pdf");
-    setStatus("PDF ready!");
-    showToast("PDF generated!", 1200);
+        setStatus("");
+        showToast("Preparing PDF...");
+
+        const { jsPDF } = window.jspdf;
+        let pdf;
+        let pageW, pageH;
+
+        // FIT mode
+        if (pdfSize === "fit") {
+            setStatus("Processing first image for Fit...");
+            const firstCompressed = await processImageFile(pickedImages[0], uiMax, uiQuality);
+            const firstImg = await loadImage(firstCompressed);
+            [pageW, pageH] = calcFitPageSize(firstImg.width, firstImg.height, uiMax);
+            pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: true, worker: true });
+
+            const scale = Math.min(pageW / firstImg.width, pageH / firstImg.height, 1);
+            const w = Math.round(firstImg.width * scale);
+            const h = Math.round(firstImg.height * scale);
+            const x = Math.round((pageW - w) / 2);
+            const y = Math.round((pageH - h) / 2);
+            pdf.addImage(firstCompressed, "JPEG", x, y, w, h, undefined, "FAST");
+        } else {
+            pdf = new jsPDF({ unit: "px", format: pdfSize, compress: true, worker: true });
+            pageW = pdf.internal.pageSize.getWidth();
+            pageH = pdf.internal.pageSize.getHeight();
+        }
+
+        const total = pickedImages.length;
+        let processed = (pdfSize === "fit") ? 1 : 0;
+        const startIndex = (pdfSize === "fit") ? 1 : 0;
+
+        for (let s = startIndex; s < total; s += CHUNK_SIZE) {
+            const chunk = pickedImages.slice(s, s + CHUNK_SIZE);
+            for (let i = 0; i < chunk.length; i++) {
+                const idx = s + i;
+                setStatus(`Processing ${idx + 1} / ${total}`);
+                try {
+                    const compressed = await processImageFile(chunk[i], uiMax, uiQuality);
+                    const img = await loadImage(compressed);
+                    const maxW = pageW - 20;
+                    const maxH = pageH - 20;
+                    const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+                    const w = Math.round(img.width * scale);
+                    const h = Math.round(img.height * scale);
+                    const x = Math.round((pageW - w) / 2);
+                    const y = Math.round((pageH - h) / 2);
+
+                    if (!(pdfSize === "fit" && idx === 0)) pdf.addPage([pageW, pageH]);
+                    pdf.addImage(compressed, "JPEG", x, y, w, h, undefined, "FAST");
+                } catch (err) {
+                    console.warn("Skipping image due to error:", err);
+                }
+
+                processed++;
+                const percent = Math.round((processed / total) * 100);
+                showToast(`Creating PDF... ${percent}%`, 1000);
+
+                await new Promise(r => setTimeout(r, MIN_TICK));
+            }
+            await new Promise(r => setTimeout(r, 60));
+        }
+
+        setStatus("Finalizing PDF...");
+        showToast("Finalizing PDF...", 800);
+
+        const blob = pdf.output("blob");
+        const pdfFile = new File([blob], "Snap2Pdf_compressed.pdf", { type: "application/pdf" });
+
+        showToast("PDF is ready!", 1200);
+        setStatus("");
+
+        // ---------- Force Share ----------
+        try {
+            if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
+                await navigator.share({ files: [pdfFile], title: "Snap2Pdf", text: "Here is your PDF" });
+            } else {
+                pdf.save("Snap2Pdf_compressed.pdf");
+            }
+        } catch (e) {
+            console.warn("Share failed, fallback to save", e);
+            pdf.save("Snap2Pdf_compressed.pdf");
+        }
+
+    } catch (err) {
+        console.error("Unexpected error:", err);
+        showToast("Error occurred. See console.", 2000);
+        setStatus("");
+    }
 });
 
-// ---------- Service Worker ----------
+
+
+// manifest
+
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('service-worker.js')
@@ -182,7 +207,6 @@ if ('serviceWorker' in navigator) {
             .catch(err => console.error('Service Worker registration failed:', err));
     });
 }
-
 
 
 
