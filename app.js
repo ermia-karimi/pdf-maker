@@ -1,3 +1,45 @@
+let pickedImages = [];
+let pdfSize = "zeroloss"; // default mode
+
+// ---------- DOM refs ----------
+const inputEl = document.getElementById("imagePicker");
+const toastEl = document.getElementById("toast");
+const convertBtn = document.getElementById("convertBtn");
+const hh11 = document.getElementById("hh11");
+const sizeButtons = document.getElementById("sizeButtons");
+
+// ---------- Toast ----------
+function showToast(msg = "", duration = 1800) {
+    if (!toastEl) return;
+    toastEl.innerText = msg;
+    toastEl.classList.add("show");
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => toastEl.classList.remove("show"), duration);
+}
+function setStatus(text = "") {
+    if (!hh11) return;
+    hh11.innerText = text;
+    console.log(text);
+}
+
+// ---------- File select ----------
+inputEl.addEventListener("change", async (e) => {
+    pickedImages = Array.from(e.target.files || []);
+    setStatus("");
+    showToast(`Selected ${pickedImages.length} photos`);
+    await new Promise(r => setTimeout(r, 40));
+});
+
+// ---------- Size buttons ----------
+sizeButtons.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".size-btn");
+    if (!btn) return;
+    document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    pdfSize = btn.dataset.size || "zeroloss";
+});
+
+// ---------- Image processing ----------
 async function fileToDataURL(file) {
     return new Promise(res => {
         const fr = new FileReader();
@@ -9,89 +51,86 @@ async function fileToDataURL(file) {
 async function processImageRaw(file) {
     const dataUrl = await fileToDataURL(file);
     const bitmap = await createImageBitmap(file);
-
-    let format = "";
-    const mime = dataUrl.substring(5, dataUrl.indexOf(";"));
-
-    if (mime === "image/png") format = "PNG";
-    else if (mime === "image/jpeg") format = "JPEG";
-    else format = "PNG"; // fallback
-
+    const format = (dataUrl.includes("png") ? "PNG" : "JPEG");
     return { dataUrl, bitmap, format };
 }
 
+// ---------- A4 size helper ----------
 function getA4SizePx() {
     const DPI = 96;
-    return [
-        Math.round(8.27 * DPI),
-        Math.round(11.69 * DPI)
-    ];
+    return [Math.round(8.27 * DPI), Math.round(11.69 * DPI)];
 }
 
+// ---------- Main PDF creation ----------
 convertBtn.addEventListener("click", async () => {
     if (!pickedImages.length) {
         showToast("Select photos first");
         return;
     }
 
-    const mode = pdfSize;
+    setStatus("Preparing PDF...");
     const { jsPDF } = window.jspdf;
+    const MAX_PAGE_SIZE = 14000; // jsPDF internal limit
 
+    // Process first image
     const first = await processImageRaw(pickedImages[0]);
-
     let pageW, pageH;
-    let pdf;
 
-    if (mode === "zeroloss") {
-        pageW = first.bitmap.width;
-        pageH = first.bitmap.height;
-    } 
-    else if (mode === "a4") {
+    if (pdfSize === "zeroloss" || pdfSize === "fit") {
+        pageW = Math.min(first.bitmap.width, MAX_PAGE_SIZE);
+        pageH = Math.min(first.bitmap.height, MAX_PAGE_SIZE);
+    } else if (pdfSize === "a4") {
         [pageW, pageH] = getA4SizePx();
-    } 
-    else if (mode === "fit") {
-        pageW = first.bitmap.width;
-        pageH = first.bitmap.height;
     }
 
-    if (!pageW || !pageH) {
-        console.error("Invalid page size!", { pageW, pageH });
-        showToast("Photo size invalid");
+    if (!Number.isFinite(pageW) || !Number.isFinite(pageH) || pageW <= 0 || pageH <= 0) {
+        showToast("Invalid photo size", 2000);
         return;
     }
 
-    pdf = new jsPDF({
+    const pdf = new jsPDF({
         unit: "px",
         format: [pageW, pageH],
         compress: false
     });
 
-    function draw(img) {
+    // ---------- Draw function ----------
+    function drawImageOnPage(img, pageW, pageH, mode) {
         if (mode === "zeroloss" || mode === "fit") {
             pdf.addImage(img.dataUrl, img.format, 0, 0, pageW, pageH);
-        } 
-        else if (mode === "a4") {
+        } else if (mode === "a4") {
             const scale = Math.min(pageW / img.bitmap.width, pageH / img.bitmap.height);
             const w = img.bitmap.width * scale;
             const h = img.bitmap.height * scale;
             const x = (pageW - w) / 2;
             const y = (pageH - h) / 2;
-
             pdf.addImage(img.dataUrl, img.format, x, y, w, h);
         }
     }
 
-    draw(first);
+    drawImageOnPage(first, pageW, pageH, pdfSize);
 
+    // ---------- Process remaining images ----------
     for (let i = 1; i < pickedImages.length; i++) {
-        const p = await processImageRaw(pickedImages[i]);
+        const img = await processImageRaw(pickedImages[i]);
         pdf.addPage([pageW, pageH]);
-        draw(p);
+        drawImageOnPage(img, pageW, pageH, pdfSize);
+        setStatus(`Processed ${i + 1} / ${pickedImages.length}`);
     }
 
     pdf.save("Snap2PDF_Final.pdf");
-});;
+    setStatus("PDF ready!");
+    showToast("PDF generated!", 1200);
+});
 
+// ---------- Service Worker ----------
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('service-worker.js')
+            .then(reg => console.log('Service Worker registered:', reg))
+            .catch(err => console.error('Service Worker registration failed:', err));
+    });
+}
 
 
 
