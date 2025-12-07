@@ -9,14 +9,23 @@ async function fileToDataURL(file) {
 async function processImageRaw(file) {
     const dataUrl = await fileToDataURL(file);
     const bitmap = await createImageBitmap(file);
-    return { dataUrl, bitmap };
+
+    let format = "";
+    const mime = dataUrl.substring(5, dataUrl.indexOf(";"));
+
+    if (mime === "image/png") format = "PNG";
+    else if (mime === "image/jpeg") format = "JPEG";
+    else format = "PNG"; // fallback
+
+    return { dataUrl, bitmap, format };
 }
 
 function getA4SizePx() {
-    const DPI = 96;  
-    const w = (8.27 * DPI);
-    const h = (11.69 * DPI);
-    return [Math.round(w), Math.round(h)];
+    const DPI = 96;
+    return [
+        Math.round(8.27 * DPI),
+        Math.round(11.69 * DPI)
+    ];
 }
 
 convertBtn.addEventListener("click", async () => {
@@ -25,96 +34,63 @@ convertBtn.addEventListener("click", async () => {
         return;
     }
 
-    const mode = pdfSize;  
+    const mode = pdfSize;
     const { jsPDF } = window.jspdf;
-
-    let pdf;
-    let pageW, pageH;
 
     const first = await processImageRaw(pickedImages[0]);
 
-    // ----------- MODE 1: ZeroLoss (page = real photo size) -----------  
+    let pageW, pageH;
+    let pdf;
+
     if (mode === "zeroloss") {
         pageW = first.bitmap.width;
         pageH = first.bitmap.height;
-
-        pdf = new jsPDF({
-            unit: "px",
-            format: [pageW, pageH],
-            compress: false
-        });
-
-        pdf.addImage(first.dataUrl, "PNG", 0, 0, pageW, pageH);
-    }
-
-    // ----------- MODE 2: A4 (resize ONLY to fit page, minimal loss) -----------  
+    } 
     else if (mode === "a4") {
         [pageW, pageH] = getA4SizePx();
-
-        pdf = new jsPDF({
-            unit: "px",
-            format: [pageW, pageH],
-            compress: false
-        });
-
-        const scale = Math.min(pageW / first.bitmap.width, pageH / first.bitmap.height);
-        const w = first.bitmap.width * scale;
-        const h = first.bitmap.height * scale;
-        const x = (pageW - w) / 2;
-        const y = (pageH - h) / 2;
-
-        pdf.addImage(first.dataUrl, "PNG", x, y, w, h);
-    }
-
-    // ----------- MODE 3: FIT (page = size of first image) -----------  
+    } 
     else if (mode === "fit") {
         pageW = first.bitmap.width;
         pageH = first.bitmap.height;
-
-        pdf = new jsPDF({
-            unit: "px",
-            format: [pageW, pageH],
-            compress: false
-        });
-
-        pdf.addImage(first.dataUrl, "PNG", 0, 0, pageW, pageH);
     }
 
-    // ----------- OTHER IMAGES -----------
-    for (let i = 1; i < pickedImages.length; i++) {
-        const p = await processImageRaw(pickedImages[i]);
+    if (!pageW || !pageH) {
+        console.error("Invalid page size!", { pageW, pageH });
+        showToast("Photo size invalid");
+        return;
+    }
 
-        pdf.addPage([pageW, pageH]);
+    pdf = new jsPDF({
+        unit: "px",
+        format: [pageW, pageH],
+        compress: false
+    });
 
+    function draw(img) {
         if (mode === "zeroloss" || mode === "fit") {
-            pdf.addImage(
-                p.dataUrl, 
-                "PNG", 
-                0, 
-                0, 
-                pageW, 
-                pageH
-            );
-        } else if (mode === "a4") {
-            const scale = Math.min(pageW / p.bitmap.width, pageH / p.bitmap.height);
-            const w = p.bitmap.width * scale;
-            const h = p.bitmap.height * scale;
+            pdf.addImage(img.dataUrl, img.format, 0, 0, pageW, pageH);
+        } 
+        else if (mode === "a4") {
+            const scale = Math.min(pageW / img.bitmap.width, pageH / img.bitmap.height);
+            const w = img.bitmap.width * scale;
+            const h = img.bitmap.height * scale;
             const x = (pageW - w) / 2;
             const y = (pageH - h) / 2;
 
-            pdf.addImage(
-                p.dataUrl,
-                "PNG",
-                x,
-                y,
-                w,
-                h
-            );
+            pdf.addImage(img.dataUrl, img.format, x, y, w, h);
         }
     }
 
+    draw(first);
+
+    for (let i = 1; i < pickedImages.length; i++) {
+        const p = await processImageRaw(pickedImages[i]);
+        pdf.addPage([pageW, pageH]);
+        draw(p);
+    }
+
     pdf.save("Snap2PDF_Final.pdf");
-});
+});;
 
 
 
