@@ -1,5 +1,5 @@
 let pickedImages = [];
-let pdfSize = "zeroloss"; // default mode
+let pdfSize = "zeroloss"; // حالت پیش‌فرض
 
 // ---------- DOM refs ----------
 const inputEl = document.getElementById("imagePicker");
@@ -16,6 +16,7 @@ function showToast(msg = "", duration = 1800) {
     clearTimeout(showToast._t);
     showToast._t = setTimeout(() => toastEl.classList.remove("show"), duration);
 }
+
 function setStatus(text = "") {
     if (!hh11) return;
     hh11.innerText = text;
@@ -39,7 +40,7 @@ sizeButtons.addEventListener("click", (ev) => {
     pdfSize = btn.dataset.size || "zeroloss";
 });
 
-// ---------- Image processing ----------
+// ---------- Helpers ----------
 async function fileToDataURL(file) {
     return new Promise(res => {
         const fr = new FileReader();
@@ -51,14 +52,58 @@ async function fileToDataURL(file) {
 async function processImageRaw(file) {
     const dataUrl = await fileToDataURL(file);
     const bitmap = await createImageBitmap(file);
-    const format = (dataUrl.includes("png") ? "PNG" : "JPEG");
+    const format = dataUrl.includes("png") ? "PNG" : "JPEG";
     return { dataUrl, bitmap, format };
 }
 
-// ---------- A4 size helper ----------
 function getA4SizePx() {
     const DPI = 96;
     return [Math.round(8.27 * DPI), Math.round(11.69 * DPI)];
+}
+
+// ---------- Zero-Loss fixer ----------
+async function prepareZeroLossImage(imgObj) {
+    const MAX = 14000;
+
+    let w = imgObj.bitmap.width;
+    let h = imgObj.bitmap.height;
+
+    // محدود کردن سایز jsPDF
+    const ratio = Math.min(MAX / w, MAX / h, 1);
+    w = Math.round(w * ratio);
+    h = Math.round(h * ratio);
+
+    // عکس‌های خیلی کشیده یا کوچک → padded canvas
+    if (w < 50 || h < 50) {
+        const pad = 100;
+        const canvas = document.createElement("canvas");
+        canvas.width = w + pad;
+        canvas.height = h + pad;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(imgObj.bitmap, pad / 2, pad / 2, w, h);
+        return { dataUrl: canvas.toDataURL("image/png"), w: canvas.width, h: canvas.height, format: "PNG" };
+    }
+
+    // تبدیل CMYK و یا MIME عجیب → PNG
+    if (!imgObj.dataUrl.startsWith("data:image/")) {
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(imgObj.bitmap, 0, 0, w, h);
+        return { dataUrl: canvas.toDataURL("image/png"), w, h, format: "PNG" };
+    }
+
+    // حالت عادی: scale فقط برای سقف jsPDF
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(imgObj.bitmap, 0, 0, w, h);
+
+    return { dataUrl: canvas.toDataURL("image/png"), w, h, format: "PNG" };
 }
 
 // ---------- Main PDF creation ----------
@@ -70,35 +115,49 @@ convertBtn.addEventListener("click", async () => {
 
     setStatus("Preparing PDF...");
     const { jsPDF } = window.jspdf;
-    const MAX_PAGE_SIZE = 14000; // jsPDF internal limit
+    const MAX_PAGE_SIZE = 14000;
 
-    // Process first image
+    // ---------- Process first image ----------
     const first = await processImageRaw(pickedImages[0]);
     let pageW, pageH;
+    let pdf;
 
-    if (pdfSize === "zeroloss" || pdfSize === "fit") {
-        pageW = Math.min(first.bitmap.width, MAX_PAGE_SIZE);
-        pageH = Math.min(first.bitmap.height, MAX_PAGE_SIZE);
+    if (pdfSize === "zeroloss") {
+        const fixed = await prepareZeroLossImage(first);
+        pageW = fixed.w;
+        pageH = fixed.h;
+        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
+        pdf.addImage(fixed.dataUrl, fixed.format, 0, 0, pageW, pageH);
     } else if (pdfSize === "a4") {
         [pageW, pageH] = getA4SizePx();
+        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
+
+        const scale = Math.min(pageW / first.bitmap.width, pageH / first.bitmap.height);
+        const w = first.bitmap.width * scale;
+        const h = first.bitmap.height * scale;
+        const x = (pageW - w) / 2;
+        const y = (pageH - h) / 2;
+        pdf.addImage(first.dataUrl, first.format, x, y, w, h);
+    } else if (pdfSize === "fit") {
+        pageW = Math.min(first.bitmap.width, MAX_PAGE_SIZE);
+        pageH = Math.min(first.bitmap.height, MAX_PAGE_SIZE);
+        pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: false });
+        pdf.addImage(first.dataUrl, first.format, 0, 0, pageW, pageH);
     }
 
-    if (!Number.isFinite(pageW) || !Number.isFinite(pageH) || pageW <= 0 || pageH <= 0) {
-        showToast("Invalid photo size", 2000);
-        return;
-    }
+    // ---------- Process remaining images ----------
+    for (let i = 1; i < pickedImages.length; i++) {
+        const img = await processImageRaw(pickedImages[i]);
 
-    const pdf = new jsPDF({
-        unit: "px",
-        format: [pageW, pageH],
-        compress: false
-    });
+        let drawObj;
+        if (pdfSize === "zeroloss") drawObj = await prepareZeroLossImage(img);
+        else drawObj = img;
 
-    // ---------- Draw function ----------
-    function drawImageOnPage(img, pageW, pageH, mode) {
-        if (mode === "zeroloss" || mode === "fit") {
-            pdf.addImage(img.dataUrl, img.format, 0, 0, pageW, pageH);
-        } else if (mode === "a4") {
+        pdf.addPage([drawObj.w || pageW, drawObj.h || pageH]);
+
+        if (pdfSize === "zeroloss" || pdfSize === "fit") {
+            pdf.addImage(drawObj.dataUrl, drawObj.format, 0, 0, drawObj.w, drawObj.h);
+        } else if (pdfSize === "a4") {
             const scale = Math.min(pageW / img.bitmap.width, pageH / img.bitmap.height);
             const w = img.bitmap.width * scale;
             const h = img.bitmap.height * scale;
@@ -106,15 +165,7 @@ convertBtn.addEventListener("click", async () => {
             const y = (pageH - h) / 2;
             pdf.addImage(img.dataUrl, img.format, x, y, w, h);
         }
-    }
 
-    drawImageOnPage(first, pageW, pageH, pdfSize);
-
-    // ---------- Process remaining images ----------
-    for (let i = 1; i < pickedImages.length; i++) {
-        const img = await processImageRaw(pickedImages[i]);
-        pdf.addPage([pageW, pageH]);
-        drawImageOnPage(img, pageW, pageH, pdfSize);
         setStatus(`Processed ${i + 1} / ${pickedImages.length}`);
     }
 
@@ -131,6 +182,7 @@ if ('serviceWorker' in navigator) {
             .catch(err => console.error('Service Worker registration failed:', err));
     });
 }
+
 
 
 
