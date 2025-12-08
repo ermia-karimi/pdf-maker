@@ -1,36 +1,22 @@
-// Snap2PDF — Ultra-Fast + Zero-Quality-Loss + WebWorker Parallel Pipeline
-// Massive-photo mode (100–300 photos) without UI freeze
-// All images converted to PNG losslessly in worker threads
+// ==================== app.js ====================
+// Snap2PDF Ultimate: Multi-Worker + Fit / A4 / A5 / Letter + Zero Compression
 
+const WORKER_COUNT = 4;
 let pickedImages = [];
-let pdfSize = "a4";
 
-// ---------- DOM refs ----------
+// DOM
 const inputEl = document.getElementById("imagePicker");
-const toastEl = document.getElementById("toast");
 const convertBtn = document.getElementById("convertBtn");
-const hh11 = document.getElementById("hh11");
+const statusEl = document.getElementById("hh11");
 const sizeButtons = document.getElementById("sizeButtons");
 
-function showToast(msg = "", duration = 1800) {
-    if (!toastEl) return;
-    toastEl.innerText = msg;
-    toastEl.classList.add("show");
-    clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => toastEl.classList.remove("show"), duration);
-}
-function setStatus(text = "") {
-    if (hh11) hh11.innerText = text;
-}
+function setStatus(t){ statusEl.innerText = t; }
 
-// ---------- File select ----------
-inputEl.addEventListener("change", async (e) => {
+inputEl.addEventListener("change", (e) => {
     pickedImages = Array.from(e.target.files || []);
-    setStatus("");
-    showToast(`Selected ${pickedImages.length} photos`);
+    setStatus(`Selected ${pickedImages.length} images`);
 });
 
-// ---------- Size buttons ----------
 sizeButtons.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".size-btn");
     if (!btn) return;
@@ -39,133 +25,161 @@ sizeButtons.addEventListener("click", (ev) => {
     pdfSize = btn.dataset.size || "a4";
 });
 
-// ============================================================================
-//  Web Worker for massive PNG conversion (fully parallel)
-// ============================================================================
-let worker;
-function getWorker() {
-    if (worker) return worker;
-
-    const blobURL = URL.createObjectURL(new Blob([
-`self.onmessage = async (e) => {
-    const file = e.data;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-        const img = new Image();
-        img.onload = () => {
-            const c = new OffscreenCanvas(img.width, img.height);
-            const ctx = c.getContext("2d", { willReadFrequently: true });
-            ctx.drawImage(img, 0, 0);
-            c.convertToBlob({ type: "image/png" }).then(blob => {
-                const fr = new FileReader();
-                fr.onload = () => self.postMessage({ png: fr.result });
-                fr.readAsDataURL(blob);
-            });
+// Worker Pool
+function createWorkerPool(workerScript, size) {
+    let workers = [];
+    let queue = [];
+    let busy = new Array(size).fill(false);
+    for (let i = 0; i < size; i++) {
+        const w = new Worker(workerScript);
+        w.onmessage = (e) => {
+            busy[i] = false;
+            queue[i].resolve(e.data);
+            queue[i] = null;
+            runNext();
         };
-        img.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
-};`
-    ], { type: "application/javascript" }));
-
-    worker = new Worker(blobURL);
-    return worker;
-}
-
-function convertInWorker(file) {
-    return new Promise((resolve) => {
-        const w = getWorker();
-        w.onmessage = (e) => resolve(e.data.png);
-        w.postMessage(file);
-    });
-}
-
-function loadImage(src) {
-    return new Promise((res, rej) => {
-        const img = new Image();
-        img.onload = () => res(img);
-        img.onerror = rej;
-        img.crossOrigin = "anonymous";
-        img.src = src;
-    });
-}
-
-async function chunk(list, size, handler) {
-    for (let i = 0; i < list.length; i += size) {
-        const sub = list.slice(i, i + size);
-        for (let j = 0; j < sub.length; j++) {
-            await handler(sub[j], i + j);
-            await new Promise(r => setTimeout(r, 4));
-        }
-        await new Promise(r => setTimeout(r, 30));
+        workers.push(w);
     }
-}
 
-// ============================================================================
-//  PDF creation
-// ============================================================================
-convertBtn.addEventListener("click", async () => {
-    try {
-        if (!pickedImages.length) {
-            showToast("Please select photos first", 2000);
-            return;
+    function runNext() {
+        for (let i = 0; i < size; i++) {
+            if (!busy[i] && tasks.length) {
+                const task = tasks.shift();
+                busy[i] = true;
+                queue[i] = task;
+                workers[i].postMessage(task.file);
+            }
         }
+    }
 
-        setStatus("Preparing PDF...");
-        showToast("Preparing PDF...");
+    let tasks = [];
 
-        const { jsPDF } = window.jspdf;
-        const pdf = new jsPDF({ unit: "px", format: pdfSize, compress: false, worker: true });
-        let pageW = pdf.internal.pageSize.getWidth();
-        let pageH = pdf.internal.pageSize.getHeight();
-
-        await chunk(pickedImages, 5, async (file, index) => {
-            setStatus(`Processing ${index + 1} / ${pickedImages.length}`);
-
-            const pngData = await convertInWorker(file);
-            const img = await loadImage(pngData);
-
-            const maxW = pageW - 20;
-            const maxH = pageH - 20;
-            const scale = Math.min(maxW / img.width, maxH / img.height, 1);
-            const w = Math.round(img.width * scale);
-            const h = Math.round(img.height * scale);
-            const x = Math.round((pageW - w) / 2);
-            const y = Math.round((pageH - h) / 2);
-
-            if (index !== 0) pdf.addPage([pageW, pageH]);
-            pdf.addImage(pngData, "PNG", x, y, w, h);
-
-            const percent = Math.round(((index + 1) / pickedImages.length) * 100);
-            showToast(`Creating PDF... ${percent}%`, 800);
+    return function runTask(file) {
+        return new Promise((resolve, reject) => {
+            tasks.push({ file, resolve, reject });
+            runNext();
         });
+    };
+}
 
-        setStatus("Finalizing PDF...");
-        const blob = pdf.output("blob");
-        const file = new File([blob], "Snap2Pdf_FullQuality_Worker.pdf", { type: "application/pdf" });
+const processWithWorker = createWorkerPool("worker-img.js", WORKER_COUNT);
 
-        showToast("PDF Ready!", 1500);
-        setStatus("");
+// Helpers
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function loadImage(src){
+    return new Promise((res, rej)=>{
+        const img = new Image();
+        img.onload = ()=>res(img);
+        img.onerror=rej;
+        img.src=src;
+    });
+}
 
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({ files: [file], title: "Snap2PDF", text: "PDF ready" });
-        } else {
-            pdf.save("Snap2Pdf_FullQuality_Worker.pdf");
+// PDF Creation
+convertBtn.addEventListener("click", async () => {
+    if (!pickedImages.length){ alert("Select images first."); return; }
+
+    setStatus("Processing...");
+    const { jsPDF } = window.jspdf;
+    let pdf;
+
+    function getPageSize(size){
+        switch(size){
+            case "a4": return [595,842];
+            case "a5": return [420,595];
+            case "letter": return [612,792];
+            case "fit": return "fit";
+            default: return [595,842];
         }
-
-    } catch (err) {
-        console.error(err);
-        showToast("Error.", 2000);
-        setStatus("");
     }
+
+    const selectedSize = getPageSize(pdfSize);
+    let pageW, pageH;
+
+    if (selectedSize === "fit"){
+        const firstPng = await processWithWorker(pickedImages[0]);
+        const firstImg = await loadImage(firstPng);
+        pageW = firstImg.width;
+        pageH = firstImg.height;
+        pdf = new jsPDF({ unit: "px", format: [pageW,pageH], compress:false });
+        pdf.addImage(firstPng,"PNG",0,0,pageW,pageH);
+    } else {
+        pageW = selectedSize[0];
+        pageH = selectedSize[1];
+        pdf = new jsPDF({ unit:"px", format:selectedSize, compress:false });
+    }
+
+    let startIndex = (pdfSize === "fit") ? 1 : 0;
+    let done = startIndex;
+
+    for (let i=startIndex;i<pickedImages.length;i++){
+        const pngDataURL = await processWithWorker(pickedImages[i]);
+        const img = await loadImage(pngDataURL);
+        const scale = Math.min(pageW/img.width,pageH/img.height,1);
+        const w=img.width*scale;
+        const h=img.height*scale;
+        const x=(pageW-w)/2;
+        const y=(pageH-h)/2;
+        pdf.addPage([pageW,pageH]);
+        pdf.addImage(pngDataURL,"PNG",x,y,w,h);
+        done++;
+        setStatus(`Processed ${done}/${pickedImages.length}`);
+        await sleep(1);
+    }
+
+    const blob = pdf.output("blob");
+    const file = new File([blob],"HighQuality.pdf",{type:"application/pdf"});
+    if (navigator.canShare && navigator.canShare({files:[file]})){
+        await navigator.share({files:[file],title:"PDF"});
+    } else pdf.save("HighQuality.pdf");
+
+    setStatus("Done.");
 });
 
-// service worker
-if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('service-worker.js');
+// Service Worker
+if ('serviceWorker' in navigator){
+    window.addEventListener('load',()=>navigator.serviceWorker.register('service-worker.js'));
+}
+
+
+// ==================== worker-img.js ====================
+self.onmessage = async (e) => {
+    const file = e.data;
+    const dataURL = await readFile(file);
+    const img = await loadImage(dataURL);
+    const canvas = new OffscreenCanvas(img.width,img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img,0,0);
+    const pngBlob = await canvas.convertToBlob({type:"image/png"});
+    const pngDataURL = await blobToDataURL(pngBlob);
+    self.postMessage(pngDataURL);
+};
+
+function readFile(file){
+    return new Promise(res=>{
+        const fr = new FileReader();
+        fr.onload=()=>res(fr.result);
+        fr.readAsDataURL(file);
     });
 }
+
+function blobToDataURL(blob){
+    return new Promise(res=>{
+        const fr = new FileReader();
+        fr.onload=()=>res(fr.result);
+        fr.readAsDataURL(blob);
+    });
+}
+
+function loadImage(src){
+    return new Promise((res,rej)=>{
+        const img=new Image();
+        img.onload=()=>res(img);
+        img.onerror=rej;
+        img.src=src;
+    });
+}
+
 
 
 
