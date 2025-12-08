@@ -1,12 +1,6 @@
-// app.js — Snap2Pdf Ultra-Fast + Force-Share + Fit + Compression + Chunked
+// app.js — Snap2Pdf Ultra-Fast (No Compression / No Resize)
 let pickedImages = [];
 let pdfSize = "a4";
-
-// ---------- CONFIG ----------
-const DEFAULT_MAX_DIM = 1500;   // recommended max pixel dimension for longest side
-const DEFAULT_QUALITY = 0.85;   // JPEG quality: 0.5 .. 1
-const CHUNK_SIZE = 20;          // number of images per chunk
-const MIN_TICK = 3;             // ms to yield to UI between images
 
 // ---------- DOM refs ----------
 const inputEl = document.getElementById("imagePicker");
@@ -46,7 +40,7 @@ sizeButtons.addEventListener("click", (ev) => {
 });
 
 // ---------- Helpers ----------
-function fileToDataURL(file) {
+function fileToDataSrc(file) {
     return new Promise((res, rej) => {
         const reader = new FileReader();
         reader.onload = () => res(reader.result);
@@ -63,35 +57,6 @@ function loadImage(src) {
         img.src = src;
     });
 }
-const reuseCanvas = document.createElement("canvas");
-const reuseCtx = reuseCanvas.getContext("2d");
-function compressImageToDataURL(img, maxDim, quality) {
-    let w = img.width;
-    let h = img.height;
-    const ratio = Math.min(maxDim / w, maxDim / h, 1);
-    w = Math.round(w * ratio);
-    h = Math.round(h * ratio);
-    reuseCanvas.width = w;
-    reuseCanvas.height = h;
-    reuseCtx.clearRect(0, 0, w, h);
-    reuseCtx.drawImage(img, 0, 0, w, h);
-    return reuseCanvas.toDataURL("image/jpeg", quality);
-}
-async function processImageFile(file, maxDim, quality) {
-    const dataUrl = await fileToDataURL(file);
-    const img = await loadImage(dataUrl);
-    return compressImageToDataURL(img, maxDim, quality);
-}
-
-// ---------- Fit page size ----------
-const FIT_MAX_DIM = 2500;
-function calcFitPageSize(imgW, imgH, uiMax) {
-    const maxDim = Math.max(imgW, imgH);
-    const cap = Math.min(FIT_MAX_DIM, uiMax || DEFAULT_MAX_DIM);
-    if (maxDim <= cap) return [imgW, imgH];
-    const scale = cap / maxDim;
-    return [Math.round(imgW * scale), Math.round(imgH * scale)];
-}
 
 // ---------- Main PDF creation ----------
 convertBtn.addEventListener("click", async () => {
@@ -101,11 +66,6 @@ convertBtn.addEventListener("click", async () => {
             return;
         }
 
-        const maxDimInput = document.getElementById("maxDim");
-        const qualityInput = document.getElementById("quality");
-        const uiMax = maxDimInput ? Math.max(600, Math.min(4000, Number(maxDimInput.value) || DEFAULT_MAX_DIM)) : DEFAULT_MAX_DIM;
-        const uiQuality = qualityInput ? Math.max(0.5, Math.min(1, Number(qualityInput.value) || DEFAULT_QUALITY)) : DEFAULT_QUALITY;
-
         setStatus("");
         showToast("Preparing PDF...");
 
@@ -113,20 +73,24 @@ convertBtn.addEventListener("click", async () => {
         let pdf;
         let pageW, pageH;
 
-        // FIT mode
         if (pdfSize === "fit") {
             setStatus("Processing first image for Fit...");
-            const firstCompressed = await processImageFile(pickedImages[0], uiMax, uiQuality);
-            const firstImg = await loadImage(firstCompressed);
-            [pageW, pageH] = calcFitPageSize(firstImg.width, firstImg.height, uiMax);
+            const firstSrc = await fileToDataSrc(pickedImages[0]);
+            const firstImg = await loadImage(firstSrc);
+            const maxDim = Math.max(firstImg.width, firstImg.height);
+            const cap = 2500;
+            const scale = Math.min(cap / maxDim, 1);
+            pageW = Math.round(firstImg.width * scale);
+            pageH = Math.round(firstImg.height * scale);
+
             pdf = new jsPDF({ unit: "px", format: [pageW, pageH], compress: true, worker: true });
 
-            const scale = Math.min(pageW / firstImg.width, pageH / firstImg.height, 1);
             const w = Math.round(firstImg.width * scale);
             const h = Math.round(firstImg.height * scale);
             const x = Math.round((pageW - w) / 2);
             const y = Math.round((pageH - h) / 2);
-            pdf.addImage(firstCompressed, "JPEG", x, y, w, h, undefined, "FAST");
+
+            pdf.addImage(firstSrc, "JPEG", x, y, w, h, undefined, "FAST");
         } else {
             pdf = new jsPDF({ unit: "px", format: pdfSize, compress: true, worker: true });
             pageW = pdf.internal.pageSize.getWidth();
@@ -137,56 +101,49 @@ convertBtn.addEventListener("click", async () => {
         let processed = (pdfSize === "fit") ? 1 : 0;
         const startIndex = (pdfSize === "fit") ? 1 : 0;
 
-        for (let s = startIndex; s < total; s += CHUNK_SIZE) {
-            const chunk = pickedImages.slice(s, s + CHUNK_SIZE);
-            for (let i = 0; i < chunk.length; i++) {
-                const idx = s + i;
-                setStatus(`Processing ${idx + 1} / ${total}`);
-                try {
-                    const compressed = await processImageFile(chunk[i], uiMax, uiQuality);
-                    const img = await loadImage(compressed);
-                    const maxW = pageW - 20;
-                    const maxH = pageH - 20;
-                    const scale = Math.min(maxW / img.width, maxH / img.height, 1);
-                    const w = Math.round(img.width * scale);
-                    const h = Math.round(img.height * scale);
-                    const x = Math.round((pageW - w) / 2);
-                    const y = Math.round((pageH - h) / 2);
+        for (let s = startIndex; s < total; s++) {
+            setStatus(`Processing ${s + 1} / ${total}`);
+            try {
+                const src = await fileToDataSrc(pickedImages[s]);
+                const img = await loadImage(src);
 
-                    if (!(pdfSize === "fit" && idx === 0)) pdf.addPage([pageW, pageH]);
-                    pdf.addImage(compressed, "JPEG", x, y, w, h, undefined, "FAST");
-                } catch (err) {
-                    console.warn("Skipping image due to error:", err);
-                }
+                const maxW = pageW - 20;
+                const maxH = pageH - 20;
+                const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+                const w = Math.round(img.width * scale);
+                const h = Math.round(img.height * scale);
+                const x = Math.round((pageW - w) / 2);
+                const y = Math.round((pageH - h) / 2);
 
-                processed++;
-                const percent = Math.round((processed / total) * 100);
-                showToast(`Creating PDF... ${percent}%`, 1000);
-
-                await new Promise(r => setTimeout(r, MIN_TICK));
+                if (!(pdfSize === "fit" && s === 0)) pdf.addPage([pageW, pageH]);
+                pdf.addImage(src, "JPEG", x, y, w, h, undefined, "FAST");
+            } catch (err) {
+                console.warn("Skipping image due to error:", err);
             }
-            await new Promise(r => setTimeout(r, 60));
+
+            processed++;
+            const percent = Math.round((processed / total) * 100);
+            showToast(`Creating PDF... ${percent}%`, 900);
         }
 
         setStatus("Finalizing PDF...");
         showToast("Finalizing PDF...", 800);
 
         const blob = pdf.output("blob");
-        const pdfFile = new File([blob], "Snap2Pdf_compressed.pdf", { type: "application/pdf" });
+        const pdfFile = new File([blob], "Snap2Pdf.pdf", { type: "application/pdf" });
 
         showToast("PDF is ready!", 1200);
         setStatus("");
 
-        // ---------- Force Share ----------
         try {
             if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
                 await navigator.share({ files: [pdfFile], title: "Snap2Pdf", text: "Here is your PDF" });
             } else {
-                pdf.save("Snap2Pdf_compressed.pdf");
+                pdf.save("Snap2Pdf.pdf");
             }
         } catch (e) {
             console.warn("Share failed, fallback to save", e);
-            pdf.save("Snap2Pdf_compressed.pdf");
+            pdf.save("Snap2Pdf.pdf");
         }
 
     } catch (err) {
@@ -196,10 +153,7 @@ convertBtn.addEventListener("click", async () => {
     }
 });
 
-
-
-// manifest
-
+// service worker
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('service-worker.js')
@@ -207,6 +161,7 @@ if ('serviceWorker' in navigator) {
             .catch(err => console.error('Service Worker registration failed:', err));
     });
 }
+
 
 
 
