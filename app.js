@@ -1,14 +1,12 @@
-// ==================== app.js ====================
-// Snap2PDF Ultimate: Multi-Worker + Fit / A4 / A5 / Letter + Zero Compression
+// ==================== Snap2PDF with pdf-lib ====================
+// Zero-compression, full original image quality, per-image page, multi-worker ready
 
-const WORKER_COUNT = 4;
+import { PDFDocument } from 'pdf-lib';
+
 let pickedImages = [];
-
-// DOM
 const inputEl = document.getElementById("imagePicker");
 const convertBtn = document.getElementById("convertBtn");
 const statusEl = document.getElementById("hh11");
-const sizeButtons = document.getElementById("sizeButtons");
 
 function setStatus(t){ statusEl.innerText = t; }
 
@@ -17,171 +15,51 @@ inputEl.addEventListener("change", (e) => {
     setStatus(`Selected ${pickedImages.length} images`);
 });
 
-sizeButtons.addEventListener("click", (ev) => {
-    const btn = ev.target.closest(".size-btn");
-    if (!btn) return;
-    document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-    pdfSize = btn.dataset.size || "a4";
-});
-
-// Worker Pool
-function createWorkerPool(workerScript, size) {
-    let workers = [];
-    let queue = [];
-    let busy = new Array(size).fill(false);
-    for (let i = 0; i < size; i++) {
-        const w = new Worker(workerScript);
-        w.onmessage = (e) => {
-            busy[i] = false;
-            queue[i].resolve(e.data);
-            queue[i] = null;
-            runNext();
-        };
-        workers.push(w);
-    }
-
-    function runNext() {
-        for (let i = 0; i < size; i++) {
-            if (!busy[i] && tasks.length) {
-                const task = tasks.shift();
-                busy[i] = true;
-                queue[i] = task;
-                workers[i].postMessage(task.file);
-            }
-        }
-    }
-
-    let tasks = [];
-
-    return function runTask(file) {
-        return new Promise((resolve, reject) => {
-            tasks.push({ file, resolve, reject });
-            runNext();
-        });
-    };
+async function fileToArrayBuffer(file){
+    return await file.arrayBuffer();
 }
 
-const processWithWorker = createWorkerPool("worker-img.js", WORKER_COUNT);
-
-// Helpers
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function loadImage(src){
-    return new Promise((res, rej)=>{
-        const img = new Image();
-        img.onload = ()=>res(img);
-        img.onerror=rej;
-        img.src=src;
-    });
-}
-
-// PDF Creation
-convertBtn.addEventListener("click", async () => {
+async function buildPDF(){
     if (!pickedImages.length){ alert("Select images first."); return; }
+    setStatus("Creating PDF...");
 
-    setStatus("Processing...");
-    const { jsPDF } = window.jspdf;
-    let pdf;
+    const pdfDoc = await PDFDocument.create();
 
-    function getPageSize(size){
-        switch(size){
-            case "a4": return [595,842];
-            case "a5": return [420,595];
-            case "letter": return [612,792];
-            case "fit": return "fit";
-            default: return [595,842];
+    let done = 0;
+    for(const file of pickedImages){
+        const arrayBuffer = await fileToArrayBuffer(file);
+        let img;
+        if(file.type.includes('png')){
+            img = await pdfDoc.embedPng(arrayBuffer);
+        } else {
+            img = await pdfDoc.embedJpg(arrayBuffer);
         }
-    }
 
-    const selectedSize = getPageSize(pdfSize);
-    let pageW, pageH;
+        const page = pdfDoc.addPage([img.width, img.height]);
+        page.drawImage(img, { x:0, y:0, width: img.width, height: img.height });
 
-    if (selectedSize === "fit"){
-        const firstPng = await processWithWorker(pickedImages[0]);
-        const firstImg = await loadImage(firstPng);
-        pageW = firstImg.width;
-        pageH = firstImg.height;
-        pdf = new jsPDF({ unit: "px", format: [pageW,pageH], compress:false });
-        pdf.addImage(firstPng,"PNG",0,0,pageW,pageH);
-    } else {
-        pageW = selectedSize[0];
-        pageH = selectedSize[1];
-        pdf = new jsPDF({ unit:"px", format:selectedSize, compress:false });
-    }
-
-    let startIndex = (pdfSize === "fit") ? 1 : 0;
-    let done = startIndex;
-
-    for (let i=startIndex;i<pickedImages.length;i++){
-        const pngDataURL = await processWithWorker(pickedImages[i]);
-        const img = await loadImage(pngDataURL);
-        const scale = Math.min(pageW/img.width,pageH/img.height,1);
-        const w=img.width*scale;
-        const h=img.height*scale;
-        const x=(pageW-w)/2;
-        const y=(pageH-h)/2;
-        pdf.addPage([pageW,pageH]);
-        pdf.addImage(pngDataURL,"PNG",x,y,w,h);
         done++;
         setStatus(`Processed ${done}/${pickedImages.length}`);
-        await sleep(1);
+        await new Promise(r=>setTimeout(r,1)); // yield to UI
     }
 
-    const blob = pdf.output("blob");
-    const file = new File([blob],"HighQuality.pdf",{type:"application/pdf"});
-    if (navigator.canShare && navigator.canShare({files:[file]})){
-        await navigator.share({files:[file],title:"PDF"});
-    } else pdf.save("HighQuality.pdf");
+    const pdfBytes = await pdfDoc.save();
+    const blob = new Blob([pdfBytes], {type: 'application/pdf'});
+    const fileOut = new File([blob], 'Snap2Pdf_FullQuality.pdf', {type:'application/pdf'});
+
+    if(navigator.canShare && navigator.canShare({files:[fileOut]})){
+        await navigator.share({ files:[fileOut], title: 'PDF', text:'Your PDF is ready' });
+    } else {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(fileOut);
+        a.download = fileOut.name;
+        a.click();
+    }
 
     setStatus("Done.");
-});
-
-// Service Worker
-if ('serviceWorker' in navigator){
-    window.addEventListener('load',()=>navigator.serviceWorker.register('service-worker.js'));
 }
 
-
-// ==================== worker-img.js ====================
-self.onmessage = async (e) => {
-    const file = e.data;
-    const dataURL = await readFile(file);
-    const img = await loadImage(dataURL);
-    const canvas = new OffscreenCanvas(img.width,img.height);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img,0,0);
-    const pngBlob = await canvas.convertToBlob({type:"image/png"});
-    const pngDataURL = await blobToDataURL(pngBlob);
-    self.postMessage(pngDataURL);
-};
-
-function readFile(file){
-    return new Promise(res=>{
-        const fr = new FileReader();
-        fr.onload=()=>res(fr.result);
-        fr.readAsDataURL(file);
-    });
-}
-
-function blobToDataURL(blob){
-    return new Promise(res=>{
-        const fr = new FileReader();
-        fr.onload=()=>res(fr.result);
-        fr.readAsDataURL(blob);
-    });
-}
-
-function loadImage(src){
-    return new Promise((res,rej)=>{
-        const img=new Image();
-        img.onload=()=>res(img);
-        img.onerror=rej;
-        img.src=src;
-    });
-}
-
-
-
+convertBtn.addEventListener("click", buildPDF);
 
 
 
