@@ -1,4 +1,4 @@
-// app.js — Snap2Pdf Ultra-Fast + High-Quality + Parallel + Fit + Compression
+//app.js — Snap2Pdf Ultra-Fast + High-Quality + Parallel + Fit + Compression
 let pickedImages = [];
 let pdfSize = "a4";
 
